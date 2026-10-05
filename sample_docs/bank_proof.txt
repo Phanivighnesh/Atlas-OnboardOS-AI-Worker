@@ -1,0 +1,5 @@
+BANK ACCOUNT PROOF
+Account Holder: Priya Sharma
+Bank: Example Bank
+Account Number: 000012344821
+IFSC: EXMP0001234
