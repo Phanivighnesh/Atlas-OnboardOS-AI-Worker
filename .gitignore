@@ -3,3 +3,11 @@ dist
 __pycache__
 *.db
 *.egg-info
+.pytest_cache
+
+# Virtual environments
+.ATLAS/
+ATLAS/
+env/
+ENV/
+

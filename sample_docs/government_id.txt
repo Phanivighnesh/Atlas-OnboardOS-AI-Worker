@@ -1,3 +1,4 @@
 GOVERNMENT ID
 Name: Priya Sharma
+ID Type: Passport (fictional)
 ID Number: FAKE-0000-1234

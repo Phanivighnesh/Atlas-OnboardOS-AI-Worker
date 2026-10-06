@@ -1,5 +1,6 @@
 """OnboardOS core: FastAPI + stateful onboarding agent. Demo-only credentials. See README."""
-import os, re, json, time, sqlite3, hashlib, secrets
+import os, re, json, time, sqlite3, hashlib, secrets, smtplib
+from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
 import jwt
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
@@ -10,6 +11,8 @@ DB = os.getenv("ONBOARDOS_DB", "onboardos.db")  # relative to cwd
 SECRET = os.getenv("JWT_SECRET", "dev-only-secret")
 FAIL_FIRST = int(os.getenv("DEMO_FAIL_FIRST", "0"))   # inject N failures into record creation
 MAX_RETRIES = 3
+EMAIL_RE = r"[\w.+-]+@[\w-]+\.[\w.-]+"
+SMTP_HOST = os.getenv("SMTP_HOST")   # if unset, mail is written to the outbox table only
 
 # ---------- config-driven requirements (not hardcoded in workflow) ----------
 REQUIREMENTS = [
@@ -33,8 +36,14 @@ def init_db():
      "CREATE TABLE IF NOT EXISTS docs(id INTEGER PRIMARY KEY, case_id INT, filename TEXT, text TEXT, doc_type TEXT, status TEXT, fields TEXT, issues TEXT)",
      "CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY, case_id INT, action TEXT, risk TEXT, changes TEXT, status TEXT, decided_by TEXT, reason TEXT)",
      "CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts TEXT, case_id INT, actor TEXT, action TEXT, result TEXT, meta TEXT)",
+     "CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY, case_id INT, to_addr TEXT, subject TEXT, body TEXT, mode TEXT, ts TEXT)",
      "CREATE TABLE IF NOT EXISTS employees(case_id INT PRIMARY KEY, name TEXT, role TEXT, joining TEXT, status TEXT)"]:
         q(s)
+    _c = sqlite3.connect(DB)
+    for t, col in (("docs", "reviewed_by"), ("cases", "email")):
+        if col not in [r[1] for r in _c.execute(f"PRAGMA table_info({t})")]:
+            _c.execute(f"ALTER TABLE {t} ADD COLUMN {col} TEXT"); _c.commit()
+    _c.close()
     if not q("SELECT 1 FROM users"):
         for e, p, r in [("admin@northstarlabs.demo", "AdminDemo123!", "ADMIN"),
                         ("hr@northstarlabs.demo", "HRDemo123!", "HR_OPERATOR"),
@@ -53,15 +62,21 @@ def audit(case_id, actor, action, result="ok", **meta):
 # ---------- document service: deterministic validation + replaceable classifier ----------
 class RuleClassifier:
     """Swap for an LLM-backed classifier/extractor implementing the same two methods."""
+    PATS = {"name": r"^\s*(?:full name|name|account holder(?: name)?)\s*:\s*(.+)$", "account": r"^\s*account (?:number|no\.?)\s*:\s*(\d+)",
+            "ifsc": r"^\s*ifsc(?: code)?\s*:\s*(\w+)", "bank": r"^\s*bank(?: name)?\s*:\s*(.+)$", "address": r"^\s*address\s*:\s*(.+)$",
+            "email": r"^\s*(?:personal\s+)?e-?mail(?: id)?\s*:\s*(" + EMAIL_RE + ")", "id_type": r"^\s*id type\s*:\s*(.+)$",
+            "id_number": r"^\s*id number\s*:\s*([\w-]+)", "degree": r"^\s*degree\s*:\s*(.+)$", "tax_id": r"^\s*tax id\s*:\s*([\w-]+)",
+            "position": r"^\s*position\s*:\s*(.+)$", "joining_date": r"^\s*joining date\s*:\s*(.+)$"}
+    def extract(self, text):
+        return {k: (m.group(1).strip() if (m := re.search(p, text, re.I | re.M)) else None) for k, p in self.PATS.items()}
     def classify(self, text):
         low = text.lower()
         for r in REQUIREMENTS:
             if any(k in low for k in r["kw"]): return r["key"]
+        f = self.extract(text)                                   # unlabeled content: infer from fields
+        for t, k in (("BANK_PROOF", "ifsc"), ("ADDRESS_PROOF", "address"), ("TAX_DOC", "tax_id"), ("DEGREE", "degree"), ("GOV_ID", "id_number")):
+            if f.get(k): return t
         return "UNKNOWN"
-    def extract(self, text):
-        g = lambda p: (m.group(1).strip() if (m := re.search(p, text, re.I)) else None)
-        return {"name": g(r"(?:name|account holder):\s*(.+)"), "account": g(r"account number:\s*(\d+)"),
-                "ifsc": g(r"ifsc:\s*(\w+)"), "address": g(r"address:\s*(.+)"), "bank": g(r"bank:\s*(.+)")}
 CLASSIFIER = RuleClassifier()
 
 def norm(s): return set(re.sub(r"[^a-z ]", "", (s or "").lower()).split())
@@ -78,10 +93,20 @@ def validate(doc_type, f, employee_name):
     if doc_type == "ADDRESS_PROOF" and not f.get("address"): issues.append("Address missing")
     return issues
 
+def split_sections(text):
+    """A single file may hold several documents (a packet): split on heading lines."""
+    lines = text.splitlines()
+    heads = [i for i, l in enumerate(lines) if ":" not in l and 0 < len(l.strip()) < 45 and any(k in l.lower() for r in REQUIREMENTS for k in r["kw"])]
+    if len(heads) < 2: return [text]
+    pre = "\n".join(lines[:heads[0]]).strip()
+    parts = [(pre + "\n" if pre else "") + "\n".join(lines[a:b]) for a, b in zip(heads, heads[1:] + [len(lines)])]
+    return parts if len({CLASSIFIER.classify(p) for p in parts}) > 1 else [text]
+
 def parse_and_validate(case_id, doc_id):
     d = q("SELECT * FROM docs WHERE id=?", doc_id)[0]; c = q("SELECT * FROM cases WHERE id=?", case_id)[0]
     t = CLASSIFIER.classify(d["text"]); f = CLASSIFIER.extract(d["text"]); issues = validate(t, f, c["name"])
-    if f.get("account"): f["account"] = mask(f["account"])          # never store/display raw identifiers
+    for k in ("account", "id_number", "tax_id"):                      # never store/display raw identifiers
+        if f.get(k): f[k] = mask(f[k])
     status = "VERIFIED" if not issues else "NEEDS_REVIEW"
     q("UPDATE docs SET doc_type=?,status=?,fields=?,issues=? WHERE id=?", t, status, json.dumps(f), json.dumps(issues), doc_id)
     return {"doc_type": t, "status": status, "issues": issues}
@@ -117,12 +142,29 @@ def _create(cid):
         st["injected"] = st.get("injected", 0) + 1; q("UPDATE cases SET state=? WHERE id=?", json.dumps(st), cid)
         raise Retryable("500 from HR system")
     return {"ok": True}
+@tool("send_welcome_email", "HIGH", {"AI"}, needs_approval=True)
+def _mail(cid):
+    "Email the new hire that they are onboarded and when to start (external communication; requires admin approval)"
+    c = q("SELECT * FROM cases WHERE id=?", cid)[0]
+    if q("SELECT 1 FROM outbox WHERE case_id=?", cid): return {"already_sent": True}   # idempotent
+    subject = "Welcome to Northstar Labs — you're onboarded"
+    body = (f"Hi {c['name']},\n\nYour onboarding is complete. You're set up as {c['role']} and can start on {c['joining']}.\n"
+            "Your manager and the People team will be in touch with next steps.\n\n— Northstar Labs People Team (sent by ATLAS)")
+    mode = "smtp" if SMTP_HOST else "outbox"
+    if SMTP_HOST:
+        m = EmailMessage(); m["From"] = os.getenv("MAIL_FROM", "people@northstarlabs.demo"); m["To"] = c["email"]; m["Subject"] = subject; m.set_content(body)
+        with smtplib.SMTP(SMTP_HOST, int(os.getenv("SMTP_PORT", "587"))) as sm:
+            sm.starttls()
+            if os.getenv("SMTP_USER"): sm.login(os.getenv("SMTP_USER"), os.getenv("SMTP_PASS", ""))
+            sm.send_message(m)
+    q("INSERT INTO outbox(case_id,to_addr,subject,body,mode,ts) VALUES(?,?,?,?,?,?)", cid, c["email"], subject, body, mode, datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    return {"to": c["email"], "mode": mode}
 @tool("verify_employee_record", "LOW", {"AI"})
 def _verify(cid):
     "Read back record and compare expected vs actual"
     c = q("SELECT * FROM cases WHERE id=?", cid)[0]; e = q("SELECT * FROM employees WHERE case_id=?", cid)
     docs = q("SELECT doc_type FROM docs WHERE case_id=? AND status='VERIFIED'", cid); have = {d["doc_type"] for d in docs}
-    checks = {"Employee record": bool(e), "Name": bool(e) and e[0]["name"] == c["name"],
+    checks = {"Employee record": bool(e), "Welcome email sent": bool(q("SELECT 1 FROM outbox WHERE case_id=?", cid)), "Name": bool(e) and e[0]["name"] == c["name"],
               "Joining date": bool(e) and e[0]["joining"] == c["joining"],
               "Required documents": all(r["key"] in have for r in REQUIREMENTS if r["required"])}
     return {"checks": checks, "passed": all(checks.values())}
@@ -144,7 +186,13 @@ def run_agent(cid):
     ok = {d["doc_type"] for d in docs if d["status"] == "VERIFIED"}
     review = [d for d in docs if d["status"] == "NEEDS_REVIEW"]
     missing = [r["name"] for r in reqs if r["required"] and r["key"] not in ok and r["key"] not in {d["doc_type"] for d in review}]
-    plan = [{"step": r["name"], "state": "done" if r["key"] in ok else "review" if r["key"] in {d["doc_type"] for d in review} else "missing"} for r in reqs]
+    email = q("SELECT email FROM cases WHERE id=?", cid)[0]["email"]
+    if not email:                                                                     # look for it in verified documents
+        for d in docs:
+            e = d["status"] == "VERIFIED" and json.loads(d["fields"]).get("email")
+            if e: email = e; q("UPDATE cases SET email=? WHERE id=?", e, cid); audit(cid, "AI", "email_resolved", "ok", source=d["filename"]); break
+    if not email: missing.append("Employee email")
+    plan = [{"step": r["name"], "state": "review" if r["key"] in {d["doc_type"] for d in review} else "done" if r["key"] in ok else "missing"} for r in reqs]
     if missing or review:                                                             # DetectMissing -> pause
         set_case(cid, "BLOCKED", plan=plan, missing=missing, review=[d["id"] for d in review])
         audit(cid, "AI", "workflow_paused", "waiting_for_human", missing=missing, needs_review=[d["filename"] for d in review]); return
@@ -152,11 +200,11 @@ def run_agent(cid):
     if not ap:                                                                        # ApprovalCheck
         c = q("SELECT * FROM cases WHERE id=?", cid)[0]
         q("INSERT INTO approvals(case_id,action,risk,changes,status) VALUES(?,?,?,?,'PENDING')", cid, "CREATE_EMPLOYEE", "HIGH",
-          json.dumps({"Employee": c["name"], "Role": c["role"], "Joining date": c["joining"]}))
+          json.dumps({"Employee": c["name"], "Role": c["role"], "Joining date": c["joining"], "Welcome email to": c["email"]}))
         set_case(cid, "AWAITING_ADMIN", plan=plan, missing=[]); audit(cid, "AI", "approval_requested", "pending", risk="HIGH"); return
-    if ap[0]["status"] == "PENDING": return
+    if ap[0]["status"] == "PENDING": set_case(cid, "AWAITING_ADMIN", plan=plan, missing=[], review=[]); return
     if ap[0]["status"] == "REJECTED": set_case(cid, "BLOCKED", plan=plan); audit(cid, "AI", "halted", "rejected_by_admin"); return
-    execute_and_verify(cid, plan)
+    if ap[0]["status"] == "APPROVED": execute_and_verify(cid, plan)
 
 def execute_and_verify(cid, plan):
     set_case(cid, "AI_PROCESSING"); retries = 0
@@ -165,18 +213,26 @@ def execute_and_verify(cid, plan):
         except Retryable as e:
             retries += 1; audit(cid, "AI", "action_failed", "retryable", error=str(e), attempt=attempt)
             v = call_tool("verify_employee_record", "AI", cid)                        # check partial completion
-            if v["passed"]: audit(cid, "AI", "recovered", "record_exists_and_verified"); break
+            if all(v["checks"][k] for k in ("Employee record", "Name", "Joining date")): audit(cid, "AI", "recovered", "record_exists_and_verified"); break
             time.sleep(0.05 * 2 ** attempt)
     else:
         set_case(cid, "BLOCKED", retries=retries); audit(cid, "AI", "escalated_to_human", "max_retries"); return
+    try: call_tool("send_welcome_email", "AI", cid, approved=True)                    # external communication, approved
+    except Exception as e:
+        set_case(cid, "BLOCKED", retries=retries); audit(cid, "AI", "email_failed", "escalated_to_human", error=str(e)[:120]); return
     v = call_tool("verify_employee_record", "AI", cid)                                # VerifyOutcome
     audit(cid, "AI", "verification", "PASS" if v["passed"] else "FAIL", **v["checks"])
     set_case(cid, "COMPLETED" if v["passed"] else "BLOCKED", plan=plan, retries=retries, verification=v)
 
 # ---------- API with backend RBAC ----------
-app = FastAPI(title="OnboardOS"); bearer = HTTPBearer(auto_error=False); init_db()
+app = FastAPI(title="ATLAS"); bearer = HTTPBearer(auto_error=False); init_db()
 class Login(BaseModel): email: str; password: str
-class Goal(BaseModel): goal: str
+class Goal(BaseModel): goal: str; email: str | None = None
+class EmailIn(BaseModel): email: str
+class Ids(BaseModel): ids: list[int]
+class PwIn(BaseModel): password: str
+class CaseEdit(BaseModel): name: str | None = None; role: str | None = None; joining: str | None = None; email: str | None = None
+FAILS: dict = {}
 class Reason(BaseModel): reason: str = ""
 
 def user(cr=Depends(bearer)):
@@ -199,10 +255,13 @@ def login(b: Login):
 
 @app.post("/onboarding")
 def create_case(b: Goal, u=Depends(need(*WRITE))):
-    m = re.match(r"\s*onboard\s+(.+?)\s+(?:as|for)\s+(?:an?\s+)?(.+?)(?:,?\s*joining\s+(.+?))?\.?\s*$", b.goal, re.I)
+    found = re.search(EMAIL_RE, b.goal); em = b.email or (found[0] if found else None)
+    g = re.sub(r",?\s*(?:(?:personal\s+)?e-?mail(?:\s+id)?\s*[:\-]?\s*)?" + EMAIL_RE, "", b.goal)
+    if em and not re.fullmatch(EMAIL_RE, em): raise HTTPException(422, "Invalid email address")
+    m = re.match(r"\s*onboard\s+(.+?)\s+(?:as|for)\s+(?:an?\s+)?(.+?)(?:,?\s*joining\s+(.+?))?\.?\s*$", g, re.I)
     if not m: raise HTTPException(422, "Could not understand goal. Try: 'Onboard <name> as <role>, joining <date>'")
-    cid = q("INSERT INTO cases(goal,name,role,joining,status,state) VALUES(?,?,?,?,?,?)", b.goal, m[1], m[2], m[3] or "TBD", "DRAFT", "{}")
-    audit(cid, u["role"], "case_created", goal=b.goal); return {"id": cid, "name": m[1], "role": m[2], "joining": m[3]}
+    cid = q("INSERT INTO cases(goal,name,role,joining,status,state,email) VALUES(?,?,?,?,?,?,?)", b.goal, m[1], m[2], m[3] or "TBD", "DRAFT", "{}", em)
+    audit(cid, u["role"], "case_created", goal=b.goal); return {"id": cid, "name": m[1], "role": m[2], "joining": m[3], "email": em}
 
 @app.post("/onboarding/{cid}/start")
 def start(cid: int, u=Depends(need(*WRITE))): audit(cid, u["role"], "start_requested"); run_agent(cid); return get_case(cid, u)
@@ -212,8 +271,11 @@ async def upload(cid: int, file: UploadFile = File(...), u=Depends(need(*WRITE))
     raw = await file.read()
     if len(raw) > 2_000_000: raise HTTPException(413, "File too large")
     if not file.filename.lower().endswith((".txt", ".md")): raise HTTPException(415, "Prototype accepts text documents (PDF/DOCX/OCR parsers plug in via DocumentService)")
-    q("INSERT INTO docs(case_id,filename,text,doc_type,status,fields,issues) VALUES(?,?,?,?,?,?,?)", cid, file.filename, raw.decode("utf-8", "ignore"), None, "UPLOADED", "{}", "[]")
-    audit(cid, u["role"], "document_uploaded", filename=file.filename)
+    parts = split_sections(raw.decode("utf-8", "ignore"))                              # one file may contain several documents
+    for i, t in enumerate(parts, 1):
+        name = file.filename if len(parts) == 1 else f"{file.filename} · part {i}"
+        q("INSERT INTO docs(case_id,filename,text,doc_type,status,fields,issues) VALUES(?,?,?,?,?,?,?)", cid, name, t, None, "UPLOADED", "{}", "[]")
+    audit(cid, u["role"], "document_uploaded", filename=file.filename, documents=len(parts))
     run_agent(cid)                                                                    # agent auto-resumes
     return get_case(cid, u)
 
@@ -251,3 +313,87 @@ def tools(u=Depends(need(*ANY))): return {k: {"risk": v["risk"], "roles": sorted
 
 @app.get("/onboarding")
 def list_cases(u=Depends(need(*ANY))): return [dict(r) | {"state": json.loads(r["state"] or "{}")} for r in q("SELECT * FROM cases ORDER BY id DESC")]
+
+@app.delete("/onboarding/{cid}/documents/{did}")
+def remove_doc(cid: int, did: int, u=Depends(need(*WRITE))):
+    d = q("SELECT filename FROM docs WHERE id=? AND case_id=?", did, cid)
+    if not d: raise HTTPException(404, "Document not found")
+    q("DELETE FROM docs WHERE id=?", did); audit(cid, u["role"], "document_removed", filename=d[0]["filename"])
+    run_agent(cid); return get_case(cid, u)                                          # agent re-evaluates
+
+@app.post("/onboarding/{cid}/documents/{did}/confirm")
+def confirm_doc(cid: int, did: int, u=Depends(need(*WRITE))):
+    d = q("SELECT filename,status FROM docs WHERE id=? AND case_id=?", did, cid)
+    if not d: raise HTTPException(404, "Document not found")
+    if d[0]["status"] != "VERIFIED": raise HTTPException(409, "Only AI-verified documents can be confirmed")
+    q("UPDATE docs SET reviewed_by=? WHERE id=?", u["sub"], did)                      # human sign-off after AI check
+    audit(cid, u["role"], "document_confirmed", filename=d[0]["filename"], by=u["sub"]); return get_case(cid, u)
+
+@app.get("/onboarding/{cid}/documents/{did}/preview")
+def preview(cid: int, did: int, u=Depends(need(*ANY))):
+    r = q("SELECT * FROM docs WHERE id=? AND case_id=?", did, cid)
+    if not r: raise HTTPException(404, "Document not found")
+    d = r[0]; masked = re.sub(r"\d{5,}", lambda m: "•" * (len(m[0]) - 4) + m[0][-4:], d["text"])  # never return raw identifiers
+    audit(cid, u["role"], "document_previewed", filename=d["filename"], by=u["sub"])
+    return {"filename": d["filename"], "doc_type": d["doc_type"], "status": d["status"], "text": masked, "fields": json.loads(d["fields"])}
+
+@app.post("/onboarding/{cid}/documents/confirm")
+def confirm_many(cid: int, b: Ids, u=Depends(need(*WRITE))):
+    for did in b.ids:
+        d = q("SELECT filename,status FROM docs WHERE id=? AND case_id=?", did, cid)
+        if d and d[0]["status"] == "VERIFIED":
+            q("UPDATE docs SET reviewed_by=? WHERE id=?", u["sub"], did)
+            audit(cid, u["role"], "document_confirmed", filename=d[0]["filename"], by=u["sub"])
+    return get_case(cid, u)
+
+@app.patch("/onboarding/{cid}/email")
+def set_email(cid: int, b: EmailIn, u=Depends(need(*WRITE))):
+    if not re.fullmatch(EMAIL_RE, b.email): raise HTTPException(422, "Invalid email address")
+    q("UPDATE cases SET email=? WHERE id=?", b.email, cid); audit(cid, u["role"], "email_set", by=u["sub"])
+    run_agent(cid); return get_case(cid, u)
+
+@app.get("/onboarding/{cid}/emails")
+def emails(cid: int, u=Depends(need(*ANY))): return [dict(r) for r in q("SELECT * FROM outbox WHERE case_id=? ORDER BY id", cid)]
+
+@app.patch("/onboarding/{cid}")
+def edit_case(cid: int, b: CaseEdit, u=Depends(need(*WRITE))):
+    r = q("SELECT * FROM cases WHERE id=?", cid)
+    if not r: raise HTTPException(404, "Case not found")
+    c = r[0]
+    if c["status"] == "COMPLETED": raise HTTPException(409, "Completed cases can't be edited")
+    new = {k: v.strip() for k, v in b.__dict__.items() if v is not None}
+    if any(not v for v in new.values()): raise HTTPException(422, "Fields can't be empty")
+    if "email" in new and not re.fullmatch(EMAIL_RE, new["email"]): raise HTTPException(422, "Invalid email address")
+    changes = {k: v for k, v in new.items() if v != c[k]}                              # keys are whitelisted by the model
+    if not changes: return get_case(cid, u)
+    q("UPDATE cases SET " + ",".join(f"{k}=?" for k in changes) + " WHERE id=?", *changes.values(), cid)
+    q("DELETE FROM approvals WHERE case_id=?", cid)                                   # old approvals described the old details
+    if "name" in changes: q("UPDATE docs SET status='UPLOADED', reviewed_by=NULL WHERE case_id=?", cid)   # re-validate against new name
+    audit(cid, u["role"], "case_edited", by=u["sub"], changes=changes, approvals_reset=True, documents_revalidated="name" in changes)
+    if c["status"] != "DRAFT": run_agent(cid)
+    return get_case(cid, u)
+
+@app.delete("/onboarding/{cid}")
+def delete_case(cid: int, u=Depends(need("ADMIN"))):
+    r = q("SELECT name FROM cases WHERE id=?", cid)
+    if not r: raise HTTPException(404, "Case not found")
+    for t in ("docs", "approvals", "employees"): q(f"DELETE FROM {t} WHERE case_id=?", cid)   # personal data removed; audit trail kept
+    q("DELETE FROM cases WHERE id=?", cid)
+    audit(cid, "ADMIN", "case_deleted", name=r[0]["name"], by=u["sub"]); return {"ok": True}
+
+@app.post("/onboarding/{cid}/reveal")
+def reveal(cid: int, b: PwIn, u=Depends(need("ADMIN"))):
+    """Re-authenticate the admin, then return raw sensitive values for a short window. Every attempt is audited."""
+    now = time.time(); recent = [t for t in FAILS.get(u["sub"], []) if now - t < 300]
+    if len(recent) >= 5: raise HTTPException(429, "Too many attempts. Try again in a few minutes.")
+    row = q("SELECT pw FROM users WHERE email=?", u["sub"])
+    if not row or not check_pw(b.password, row[0]["pw"]):
+        FAILS[u["sub"]] = recent + [now]; audit(cid, "ADMIN", "sensitive_reveal", "denied_bad_password", by=u["sub"])
+        raise HTTPException(401, "Incorrect password")
+    FAILS.pop(u["sub"], None); out = {}
+    for d in q("SELECT text FROM docs WHERE case_id=? AND status='VERIFIED'", cid):
+        f = CLASSIFIER.extract(d["text"])
+        for k in ("account", "id_number", "tax_id"):
+            if f.get(k) and k not in out: out[k] = f[k]
+    audit(cid, "ADMIN", "sensitive_reveal", "granted", by=u["sub"], fields=sorted(out))
+    return {"values": out, "expires_in": 30}

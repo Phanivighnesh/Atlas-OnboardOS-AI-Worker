@@ -1,0 +1,28 @@
+OFFER LETTER
+Name: Priya Sharma
+Position: Software Engineer
+Joining Date: 20 October 2026
+Personal Email: priya.sharma.personal@example.test
+
+GOVERNMENT ID
+Name: Priya Sharma
+ID Type: Passport (fictional)
+ID Number: FAKE-0000-1234
+
+DEGREE CERTIFICATE
+Name: Priya Sharma
+Degree: B.Tech Computer Science
+
+BANK ACCOUNT PROOF
+Account Holder: Priya Sharma
+Bank: Example Bank
+Account Number: 000012344821
+IFSC: EXMP0001234
+
+TAX FORM
+Name: Priya Sharma
+Tax ID: FAKE-TAX-001
+
+ADDRESS PROOF
+Name: Priya Sharma
+Address: 12 Lake Road, Hyderabad

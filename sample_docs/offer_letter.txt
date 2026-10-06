@@ -2,3 +2,4 @@ OFFER LETTER
 Name: Priya Sharma
 Position: Software Engineer
 Joining Date: 20 October 2026
+Personal Email: priya.sharma.personal@example.test
